@@ -2,187 +2,187 @@ package database
 
 import (
 	"context"
-	"fmt"
-	"sync"
 	"time"
 
-	"github.com/EduLearn/notification-service/internal/domain"
-	"github.com/EduLearn/notification-service/internal/infrastructure/email"
-	"github.com/EduLearn/notification-service/internal/infrastructure/redis"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/Shafeeqth/notification-service/internal/domain"
+	"github.com/Shafeeqth/notification-service/internal/infrastructure/notification"
+	"github.com/Shafeeqth/notification-service/internal/infrastructure/redis"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 type Repository struct {
-	db    *pgxpool.Pool
-	email *email.EmailSender
-	// optStore map[string]domain.OTP
-	redis    *redis.RedisClient
-	otpMutex sync.RWMutex
-	logger   *zap.Logger
+	db     *gorm.DB
+	sender *notification.NotificationSender
+	redis  *redis.RedisClient
+	logger *zap.Logger
 }
 
-func NewRepository(db *DB, emailSender *email.EmailSender, redisClient *redis.RedisClient, logger *zap.Logger) *Repository {
+func NewRepository(db *DB, sender *notification.NotificationSender, redisClient *redis.RedisClient, logger *zap.Logger) *Repository {
 	return &Repository{
-		db:    db.pool,
-		email: emailSender,
-		redis: redisClient,
-		// optStore: make(map[string]domain.OTP),
+		db:     db.DB(),
+		sender: sender,
+		redis:  redisClient,
 		logger: logger,
 	}
 }
 
-func (r *Repository) SaveNotification(ctx context.Context, notification domain.Notification) error {
-	query := `
-	INSERT INTO notification (id, user_id, type, subject, body, is_ready, created_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
-	_, err := r.db.Exec(ctx, query, notification.ID, notification.UserId, notification.Type, notification.Subject, notification.Body, notification.IsRead, notification.CreatedAt)
-	if err != nil {
-		r.logger.Error("Failed to save notifications", zap.Error(err))
+func (r *Repository) AutoMigrate() error {
+	if err := r.db.AutoMigrate(&domain.Notification{}, &domain.ProcessedNotification{}); err != nil {
+		r.logger.Error("Failed to auto-migrate database", zap.Error(err))
 		return err
+	}
+	r.logger.Info("Database migration completed")
+	return nil
+}
+
+func (r *Repository) SaveNotification(ctx context.Context, notification domain.Notification) error {
+	if notification.ID == "" {
+		notification.ID = uuid.New().String()
+	}
+	if err := r.db.WithContext(ctx).Create(&notification).Error; err != nil {
+		r.logger.Error("Failed to save notification", zap.Error(err))
+		return domain.ErrDatabase
 	}
 	r.logger.Info("Notification saved", zap.String("id", notification.ID))
 	return nil
 }
 
-func (r *Repository) BatchSaveNotifications(ctx context.Context, notifications []domain.Notification) error {
-	batch := &pgx.Batch{}
-	for _, n := range notifications {
-		query := `
-		INSERT INTO notifications (id, use_id, type, subject, body, is_read, created_at) 
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`
-		batch.Queue(query, n.ID, n.UserId, n.Type, n.Subject, n.Body, n.IsRead, n.CreatedAt)
-
+func (r *Repository) GetANotification(ctx context.Context, notificationID, userID string) (*domain.Notification, error) {
+	var notification domain.Notification
+	if err := r.db.WithContext(ctx).
+		Where("id = ? AND user_id = ?", notificationID, userID).
+		First(&notification).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			r.logger.Warn("Notification not found",
+				zap.String("notification_id", notificationID),
+				zap.String("user_id", userID))
+			return nil, domain.ErrNotFound
+		}
+		r.logger.Error("Failed to get notification",
+			zap.String("notification_id", notificationID),
+			zap.Error(err))
+		return nil, domain.ErrDatabase
 	}
-	results := r.db.SendBatch(ctx, batch)
-	defer results.Close()
+	return &notification, nil
+}
 
-	for i := 0; i < batch.Len(); i++ {
-		_, err := results.Exec()
-		r.logger.Error("Failed to batch save notifications", zap.Error(err))
-		return err
+func (r *Repository) GetAllNotifications(ctx context.Context, userId string, page, pageSize int, isRead *bool, notifyType *string) ([]domain.Notification, int64, error) {
+	var notifications []domain.Notification
+	var total int64
+
+	query := r.db.WithContext(ctx).Model(&domain.Notification{}).Where("user_id = ?", userId)
+	if isRead != nil {
+		query = query.Where("is_read = ?", *isRead)
 	}
-	r.logger.Info("Batch saved notifications", zap.Int("count", len(notifications)))
-	return nil
+
+	// Get total count
+	if err := query.Count(&total).Error; err != nil {
+		r.logger.Error("Failed to count notifications",
+			zap.String("user_id", userId),
+			zap.Error(err))
+		return nil, 0, domain.ErrDatabase
+	}
+
+	// Apply pagination
+	offset := (page - 1) * pageSize
+	if err := query.
+		Order("created_at DESC").
+		Offset(offset).
+		Limit(pageSize).
+		Find(&notifications).Error; err != nil {
+		r.logger.Error("Failed to get notifications",
+			zap.String("user_id", userId),
+			zap.Error(err))
+		return nil, 0, domain.ErrDatabase
+	}
+	return notifications, total, nil
 
 }
 
-func (r *Repository) GetAllNotifications(ctx context.Context, userId string) ([]domain.Notification, error) {
-	query := `
-	SELECT id, user_id, type, subject, body, is_read, created_at 
-	From notifications WHERE user_id = $1 
-	ORDER BY created_at DESC
-	LIMIT 100
-	`
-	rows, err := r.db.Query(ctx, query, userId)
-	if err != nil {
-		r.logger.Error("Failed to get notifications", zap.String("user_id", userId))
-		return nil, err
+func (r *Repository) MarkAsRead(ctx context.Context, notificationID, userID string) error {
+	result := r.db.WithContext(ctx).
+		Model(&domain.Notification{}).
+		Where("id = ? AND user_id = ?", notificationID, userID).
+		Update("is_read", true)
+	if result.Error != nil {
+		r.logger.Error("Failed to mark notification as read",
+			zap.String("notification_id", notificationID),
+			zap.Error(result.Error))
+		return domain.ErrDatabase
 	}
-	defer rows.Close()
+	if result.RowsAffected == 0 {
+		r.logger.Warn("Notification not found or unauthorized",
+			zap.String("notification_id", notificationID),
+			zap.String("user_id", userID))
+		return domain.ErrUnauthorized
+	}
+	return nil
+}
 
-	var notifications []domain.Notification
-	for rows.Next() {
-		var n domain.Notification
-		if err := rows.Scan(&n.ID, &n.UserId, &n.Subject, &n.Type, &n.Subject, &n.Body, &n.IsRead, &n.CreatedAt); err != nil {
-			r.logger.Error("Failed to scan notification", zap.Error(err))
-			return nil, err
-		}
-		notifications = append(notifications, n)
+func (r *Repository) MarkAllAsRead(ctx context.Context, userID string) error {
+	result := r.db.WithContext(ctx).
+		Model(&domain.Notification{}).
+		Where("user_id = ? AND is_read = ?", userID, false).
+		Update("is_read", true)
+	if result.Error != nil {
+		r.logger.Error("Failed to mark all notifications as read",
+			zap.String("user_id", userID),
+			zap.Error(result.Error))
+		return domain.ErrDatabase
 	}
-	return notifications, nil
+	r.logger.Info("Marked all notifications as read",
+		zap.String("user_id", userID),
+		zap.Int64("rows_affected", result.RowsAffected))
+	return nil
 }
 
 func (r *Repository) CheckIfProcessed(ctx context.Context, notificationID string) (bool, error) {
-    var exists bool
-    query := `SELECT EXISTS(SELECT 1 FROM processed_notifications WHERE notification_id = $1)`
-    err := r.db.QueryRow(ctx, query, notificationID).Scan(&exists)
-    if err != nil {
-        r.logger.Error("Failed to check if notification processed",
-            zap.String("notification_id", notificationID),
-            zap.Error(err))
-        return false, domain.ErrDatabase
-    }
-    return exists, nil
+	var processed domain.ProcessedNotification
+	err := r.db.WithContext(ctx).
+		Where("notification_id = ?", notificationID).
+		First(&processed).Error
+	if err == gorm.ErrRecordNotFound {
+		return false, nil
+	}
+	if err != nil {
+		r.logger.Error("Failed to check if notification processed",
+			zap.String("notification_id", notificationID),
+			zap.Error(err))
+		return false, domain.ErrDatabase
+	}
+	return true, nil
 }
 
 func (r *Repository) MarkAsProcessed(ctx context.Context, notificationID string) error {
-    query := `INSERT INTO processed_notifications (notification_id) VALUES ($1) ON CONFLICT DO NOTHING`
-    _, err := r.db.Exec(ctx, query, notificationID)
-    if err != nil {
-        r.logger.Error("Failed to mark notification as processed",
-            zap.String("notification_id", notificationID),
-            zap.Error(err))
-        return domain.ErrDatabase
-    }
-    return nil
-}
-
-func (r *Repository) MarkAsRead(ctx context.Context, notificationId, userId string) error {
-	query := `
-	UPDATE notifications 
-	SET is_read = TRUE
-	WHERE id= $1 and user_id = $2 
-	`
-	result, err := r.db.Exec(ctx, query, notificationId, userId)
-	if err != nil {
-		r.logger.Error("Failed to mark notification as read", zap.Error(err))
-		return err
+	processed := domain.ProcessedNotification{
+		NotificationId: notificationID,
+		CreatedAt:      time.Now(),
 	}
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("notification not found or not authorized")
-	}
-	return nil
-}
-
-func (r *Repository) MarkAllAsRead(ctx context.Context, userId string) error {
-	query := `
-	UPDATE notifications 
-	SET is_read = TRUE
-	WHERE and user_id = $1 
-	`
-	result, err := r.db.Exec(ctx, query, userId)
-	if err != nil {
-		r.logger.Error("Failed to mark all notifications as read", zap.Error(err))
-		return err
-	}
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("notifications not found or not authorized")
+	if err := r.db.WithContext(ctx).Create(&processed).Error; err != nil {
+		r.logger.Error("Failed to mark notification as processed",
+			zap.String("notification_id", notificationID),
+			zap.Error(err))
+		return domain.ErrDatabase
 	}
 	return nil
 }
 
 func (r *Repository) SendEmail(ctx context.Context, recipient, subject, body string) error {
-	return r.email.SendEmail(ctx, recipient, subject, body)
+	notification := domain.Notification{
+		Recipient: recipient,
+		Subject:   subject,
+		Body:      body,
+		Type:      domain.EmailNotification,
+	}
+	return r.sender.Send(ctx, notification)
 }
 
 func (r *Repository) SaveOTP(ctx context.Context, otp domain.OTP) error {
-	r.otpMutex.Lock()
-	defer r.otpMutex.Unlock()
-
-	r.redis.SaveOTP(ctx, otp)
-	r.logger.Info("OTP saved", zap.String("email", otp.Email))
-	return nil
+	return r.redis.SaveOTP(ctx, otp)
 }
 
 func (r *Repository) GetOTP(ctx context.Context, email string) (domain.OTP, error) {
-	r.otpMutex.RLock()
-	defer r.otpMutex.RUnlock()
-
-	otp, err := r.redis.GetOTP(ctx, email)
-	if err != nil {
-		r.logger.Warn("OTP not found", zap.String("email", email))
-		return domain.OTP{}, fmt.Errorf("OTP not found for  n : %s", email)
-	}
-
-	if time.Now().After(otp.ExpiresAt) {
-		r.logger.Warn("OTP expired", zap.String("email", email))
-		return domain.OTP{}, fmt.Errorf("OTP expired for email: %s", email)
-
-	}
-	return otp, nil
-
+	return r.redis.GetOTP(ctx, email)
 }
