@@ -59,7 +59,7 @@ notification-service/
 
 ## Tech Stack
 
-The Notification Service is built using the following technologies:
+The Notification Service is built using the following tech stack:
 
 - **Programming Language**: Go (Golang)
 - **Message Broker**: Kafka (for asynchronous processing)
@@ -98,7 +98,7 @@ The Notification Service is built using the following technologies:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-repo/notification-service.git
+   git clone https://github.com/ShafeeqTh/notification-service.git
    cd notification-service
    ```
 
@@ -109,7 +109,7 @@ The Notification Service is built using the following technologies:
 
 3. Generate gRPC code:
    ```bash
-   protoc --go_out=. --go-grpc_out=. internal/presentation/proto/notification.proto
+   protoc --go_out=. --go-grpc_out=. internal/proto/notification.proto
    ```
 
 4. Start dependencies using Docker Compose:
